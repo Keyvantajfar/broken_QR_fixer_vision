@@ -11,11 +11,13 @@ Features
 - Deduplicates by file content (SHA-256).
 - Categorizes images into "high_quality" if resolution >= 1280x720.
 - Creates folder named from search term (e.g., "brad_pitt").
+- Preserves descriptive filenames from source URLs when possible.
 
 Usage
-  python the_program.py --search "brad pitt" -n 100
-  python the_program.py --search "cute cats" -n 1000 --concurrency 20
-  python the_program.py --search "brad pitt" -n 300 --also-scrape-pages --pages 40
+  python image_scraper.py --search "brad pitt" -n 100
+  python image_scraper.py --search "cute cats" -n 1000 --concurrency 20
+  # scrape DuckDuckGo image results and also parse the top 40 web pages for inline images
+  python image_scraper.py --search "brad pitt" -n 300 --also-scrape-pages --pages 40
 
 Notes
 - Respect site terms/robots and copyright. This is for personal/educational use.
@@ -35,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote
 
 import aiohttp
 from aiohttp import ClientSession
@@ -49,11 +51,16 @@ except Exception:
     HAVE_BS4 = False
 
 try:
-    # duckduckgo_search >= 6
-    from duckduckgo_search import DDGS
+    # Preferred new package name
+    from ddgs import DDGS
     HAVE_DDG = True
 except Exception:
-    HAVE_DDG = False
+    try:
+        # Fallback to the old package for compatibility
+        from duckduckgo_search import DDGS  # type: ignore
+        HAVE_DDG = True
+    except Exception:
+        HAVE_DDG = False
 
 
 # ----------------------------- Helpers -----------------------------
@@ -70,6 +77,14 @@ def slugify(text: str) -> str:
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s-]+", "_", text)
     return text[:100] if text else "query"
+
+def safe_filename(name: str) -> str:
+    """Sanitize a filename while preserving readability."""
+    name = unquote(name)
+    name = name.strip().replace("/", "_").replace("\\", "_")
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    name = re.sub(r"_+", "_", name)
+    return name[:120]
 
 def guess_ext(url: str, content_type: Optional[str]) -> str:
     # Priority 1: content-type
@@ -96,10 +111,13 @@ def guess_ext(url: str, content_type: Optional[str]) -> str:
 def is_image_content_type(ct: Optional[str]) -> bool:
     return bool(ct and ct.lower().startswith("image/"))
 
-def qualifies_hq(img: Image.Image, min_w=1280, min_h=720) -> bool:
+def qualifies_hq(img: Image.Image, min_w: int = 1280, min_h: int = 720) -> bool:
+    """Return True if image meets or exceeds the min resolution in any orientation."""
     try:
         w, h = img.size
-        return (w >= min_w and h >= min_h) or (h >= min_w and w >= min_h)  # handle rotated
+        # Compare the smaller and larger dimension against the thresholds so portrait
+        # images are treated the same as landscape ones.
+        return min(w, h) >= min(min_w, min_h) and max(w, h) >= max(min_w, min_h)
     except Exception:
         return False
 
@@ -133,7 +151,7 @@ async def ddg_image_urls(query: str, max_results: int) -> List[str]:
     try:
         with DDGS() as ddgs:
             for r in ddgs.images(
-                keywords=query,
+                query,
                 max_results=max_results,
                 safesearch="Off",  # You can change to "Moderate"/"Strict"
             ):
@@ -152,7 +170,7 @@ async def ddg_top_pages(query: str, max_pages: int) -> List[str]:
     try:
         with DDGS() as ddgs:
             for r in ddgs.text(
-                keywords=query,
+                query,
                 max_results=max_pages,
                 safesearch="Off",
             ):
@@ -198,7 +216,7 @@ async def scrape_imgs_from_page(session: ClientSession, page_url: str, timeout: 
             h = int(h) if h is not None else None
         except Exception:
             w = h = None
-        if w and h and (w < 120 or h < 120):
+        if w and h and (w < 64 or h < 64):
             continue
 
         # Skip obvious tracker pixels
@@ -229,7 +247,7 @@ class Downloader:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.hqdir.mkdir(parents=True, exist_ok=True)
         self.target_count = target_count
-        self.sem = asyncio.Semaphore(concurrency)
+        self.concurrency = concurrency
         self.timeout = timeout
         self.headers = {"User-Agent": user_agent, "Accept": "*/*"}
         self.min_hq_w = min_hq_w
@@ -247,18 +265,17 @@ class Downloader:
         last_exc: Optional[Exception] = None
         while tries <= self.max_retries:
             try:
-                async with self.sem:
-                    async with session.get(url, timeout=self.timeout, headers=self.headers, allow_redirects=True) as resp:
-                        if resp.status != 200:
-                            tries += 1
-                            continue
-                        ct = resp.headers.get("content-type", "")
-                        if not is_image_content_type(ct):
-                            # Some servers don't set content-type; still try reading
-                            data = await resp.read()
-                            return data, ct
+                async with session.get(url, timeout=self.timeout, headers=self.headers, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        tries += 1
+                        continue
+                    ct = resp.headers.get("content-type", "")
+                    if not is_image_content_type(ct):
+                        # Some servers don't set content-type; still try reading
                         data = await resp.read()
                         return data, ct
+                    data = await resp.read()
+                    return data, ct
             except Exception as e:
                 last_exc = e
                 tries += 1
@@ -269,6 +286,12 @@ class Downloader:
         return hashlib.sha256(data).hexdigest()
 
     def _save_image(self, data: bytes, url: str, content_type: Optional[str]) -> Optional[Path]:
+        """Persist image bytes to disk if they look valid.
+
+        A quick length check helps avoid writing empty placeholder files when a
+        server responds with no content or an unexpected payload."""
+        if not data:
+            return None
         ext = guess_ext(url, content_type)
         if ext.lower() not in VALID_EXTS:
             ext = ".jpg"
@@ -292,7 +315,21 @@ class Downloader:
         is_hq = qualifies_hq(img, self.min_hq_w, self.min_hq_h)
 
         subdir = self.hqdir if is_hq else self.outdir
-        path = subdir / f"{h}{ext}"
+
+        # Attempt to preserve a readable filename from the URL
+        basename = os.path.basename(urlparse(url).path)
+        basename = basename.split("?")[0].split("#")[0]
+        base, _ = os.path.splitext(basename)
+        base = safe_filename(base)
+        if base:
+            filename = f"{base}{ext}"
+        else:
+            filename = f"{h}{ext}"
+        path = subdir / filename
+        if path.exists():
+            filename = f"{base or h}_{h[:8]}{ext}"
+            path = subdir / filename
+
         try:
             with open(path, "wb") as f:
                 f.write(data)
@@ -302,18 +339,42 @@ class Downloader:
 
     async def download_many(self, urls: List[str]) -> int:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=self.timeout, sock_read=self.timeout)
-        connector = aiohttp.TCPConnector(limit=0, force_close=False)
+        connector = aiohttp.TCPConnector(limit=self.concurrency)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True) as session:
-            for url in urls:
-                if self.saved >= self.target_count:
-                    break
+            async def fetch_and_save(url: str) -> None:
                 data, ct = await self._fetch_bytes(session, url)
-                if not data:
-                    continue
-                saved_path = self._save_image(data, url, ct)
-                if saved_path:
-                    self.saved += 1
-                    print(f"[{self.saved}/{self.target_count}] saved: {saved_path}")
+                if data:
+                    saved_path = self._save_image(data, url, ct)
+                    if saved_path:
+                        self.saved += 1
+                        print(f"[{self.saved}/{self.target_count}] saved: {saved_path}")
+
+            it = iter(urls)
+            tasks: Set[asyncio.Task] = set()
+            # Prime initial batch
+            for _ in range(self.concurrency):
+                try:
+                    url = next(it)
+                except StopIteration:
+                    break
+                tasks.add(asyncio.create_task(fetch_and_save(url)))
+
+            while tasks and self.saved < self.target_count:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for _ in done:
+                    pass  # results already handled in fetch_and_save
+                if self.saved >= self.target_count:
+                    for t in tasks:
+                        t.cancel()
+                    break
+                for _ in done:
+                    try:
+                        url = next(it)
+                    except StopIteration:
+                        continue
+                    tasks.add(asyncio.create_task(fetch_and_save(url)))
+
+            await asyncio.gather(*tasks, return_exceptions=True)
         return self.saved
 
 
@@ -331,7 +392,7 @@ async def main():
     ap.add_argument("--hq-height", type=int, default=720, help="Min HQ height (default 720)")
     ap.add_argument("--max-candidates", type=int, default=5000, help="Max image URLs to gather before downloading (default 5000)")
     ap.add_argument("--also-scrape-pages", action="store_true", help="Also scrape top web pages for <img> tags")
-    ap.add_argument("--pages", type=int, default=30, help="How many top pages to scrape when --also-scrape-pages (default 30)")
+    ap.add_argument("--pages", type=int, default=30, help="Number of search result pages to parse for additional inline images when --also-scrape-pages is set (default 30)")
     args = ap.parse_args()
 
     query = args.search.strip()
