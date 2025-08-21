@@ -142,11 +142,11 @@ def normalize_img_url(u: str) -> Optional[str]:
 
 # ---------------------------- URL Sources ----------------------------
 
-async def ddg_image_urls(query: str, max_results: int) -> List[str]:
+async def ddg_image_urls(query: str, max_results: int, gif_only: bool = False) -> List[str]:
     if not HAVE_DDG:
         print("[warn] duckduckgo_search not installed. `pip install duckduckgo_search`", file=sys.stderr)
         return []
-    urls = []
+    urls: List[str] = []
     # DDGS().images returns a generator of dicts with key 'image'
     try:
         with DDGS() as ddgs:
@@ -154,6 +154,7 @@ async def ddg_image_urls(query: str, max_results: int) -> List[str]:
                 query,
                 max_results=max_results,
                 safesearch="Off",  # You can change to "Moderate"/"Strict"
+                type_image="gif" if gif_only else None,
             ):
                 u = normalize_img_url(r.get("image") or r.get("thumbnail") or "")
                 if u:
@@ -416,7 +417,7 @@ async def main():
     # Gather more than needed to compensate for dead links
     want = min(args.max_candidates, max(args.n * 4, args.n + 200))
     print(f"[info] gathering up to {want} candidates from DuckDuckGo Images...")
-    ddg_urls = await ddg_image_urls(query, max_results=want)
+    ddg_urls = await ddg_image_urls(query, max_results=want, gif_only=args.gif)
     candidates.extend(ddg_urls)
 
     if args.also_scrape_pages:
@@ -429,12 +430,12 @@ async def main():
                 pages = await ddg_top_pages(query, max_pages=args.pages)
                 for i, p in enumerate(pages, 1):
                     imgs = await scrape_imgs_from_page(session, p, timeout=args.timeout)
+                    if args.gif:
+                        imgs = [u for u in imgs if u.lower().split('?')[0].endswith('.gif')]
                     candidates.extend(imgs)
                     print(f"[info] scraped page {i}/{len(pages)}: +{len(imgs)} images")
 
     candidates = unique([normalize_img_url(u) for u in candidates if normalize_img_url(u)])
-    if args.gif:
-        candidates = [u for u in candidates if u.lower().split('?')[0].endswith('.gif')]
     print(f"[info] total unique candidate URLs: {len(candidates)}")
 
     if not candidates:
