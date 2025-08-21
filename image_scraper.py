@@ -13,9 +13,10 @@ Features
 - Creates folder named from search term (e.g., "brad_pitt").
 
 Usage
-  python the_program.py --search "brad pitt" -n 100
-  python the_program.py --search "cute cats" -n 1000 --concurrency 20
-  python the_program.py --search "brad pitt" -n 300 --also-scrape-pages --pages 40
+  python image_scraper.py --search "brad pitt" -n 100
+  python image_scraper.py --search "cute cats" -n 1000 --concurrency 20
+  # scrape DuckDuckGo image results and also parse the top 40 web pages for inline images
+  python image_scraper.py --search "brad pitt" -n 300 --also-scrape-pages --pages 40
 
 Notes
 - Respect site terms/robots and copyright. This is for personal/educational use.
@@ -269,6 +270,12 @@ class Downloader:
         return hashlib.sha256(data).hexdigest()
 
     def _save_image(self, data: bytes, url: str, content_type: Optional[str]) -> Optional[Path]:
+        """Persist image bytes to disk if they look valid.
+
+        A quick length check helps avoid writing empty placeholder files when a
+        server responds with no content or an unexpected payload."""
+        if not data:
+            return None
         ext = guess_ext(url, content_type)
         if ext.lower() not in VALID_EXTS:
             ext = ".jpg"
@@ -331,7 +338,7 @@ async def main():
     ap.add_argument("--hq-height", type=int, default=720, help="Min HQ height (default 720)")
     ap.add_argument("--max-candidates", type=int, default=5000, help="Max image URLs to gather before downloading (default 5000)")
     ap.add_argument("--also-scrape-pages", action="store_true", help="Also scrape top web pages for <img> tags")
-    ap.add_argument("--pages", type=int, default=30, help="How many top pages to scrape when --also-scrape-pages (default 30)")
+    ap.add_argument("--pages", type=int, default=30, help="Number of search result pages to parse for additional inline images when --also-scrape-pages is set (default 30)")
     args = ap.parse_args()
 
     query = args.search.strip()
