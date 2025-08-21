@@ -50,11 +50,16 @@ except Exception:
     HAVE_BS4 = False
 
 try:
-    # duckduckgo_search >= 6
-    from duckduckgo_search import DDGS
+    # Preferred new package name
+    from ddgs import DDGS
     HAVE_DDG = True
 except Exception:
-    HAVE_DDG = False
+    try:
+        # Fallback to the old package for compatibility
+        from duckduckgo_search import DDGS  # type: ignore
+        HAVE_DDG = True
+    except Exception:
+        HAVE_DDG = False
 
 
 # ----------------------------- Helpers -----------------------------
@@ -97,10 +102,13 @@ def guess_ext(url: str, content_type: Optional[str]) -> str:
 def is_image_content_type(ct: Optional[str]) -> bool:
     return bool(ct and ct.lower().startswith("image/"))
 
-def qualifies_hq(img: Image.Image, min_w=1280, min_h=720) -> bool:
+def qualifies_hq(img: Image.Image, min_w: int = 1280, min_h: int = 720) -> bool:
+    """Return True if image meets or exceeds the min resolution in any orientation."""
     try:
         w, h = img.size
-        return (w >= min_w and h >= min_h) or (h >= min_w and w >= min_h)  # handle rotated
+        # Compare the smaller and larger dimension against the thresholds so portrait
+        # images are treated the same as landscape ones.
+        return min(w, h) >= min(min_w, min_h) and max(w, h) >= max(min_w, min_h)
     except Exception:
         return False
 
@@ -134,7 +142,7 @@ async def ddg_image_urls(query: str, max_results: int) -> List[str]:
     try:
         with DDGS() as ddgs:
             for r in ddgs.images(
-                keywords=query,
+                query,
                 max_results=max_results,
                 safesearch="Off",  # You can change to "Moderate"/"Strict"
             ):
@@ -153,7 +161,7 @@ async def ddg_top_pages(query: str, max_pages: int) -> List[str]:
     try:
         with DDGS() as ddgs:
             for r in ddgs.text(
-                keywords=query,
+                query,
                 max_results=max_pages,
                 safesearch="Off",
             ):
@@ -199,7 +207,7 @@ async def scrape_imgs_from_page(session: ClientSession, page_url: str, timeout: 
             h = int(h) if h is not None else None
         except Exception:
             w = h = None
-        if w and h and (w < 120 or h < 120):
+        if w and h and (w < 64 or h < 64):
             continue
 
         # Skip obvious tracker pixels
@@ -230,7 +238,7 @@ class Downloader:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.hqdir.mkdir(parents=True, exist_ok=True)
         self.target_count = target_count
-        self.sem = asyncio.Semaphore(concurrency)
+        self.concurrency = concurrency
         self.timeout = timeout
         self.headers = {"User-Agent": user_agent, "Accept": "*/*"}
         self.min_hq_w = min_hq_w
@@ -248,18 +256,17 @@ class Downloader:
         last_exc: Optional[Exception] = None
         while tries <= self.max_retries:
             try:
-                async with self.sem:
-                    async with session.get(url, timeout=self.timeout, headers=self.headers, allow_redirects=True) as resp:
-                        if resp.status != 200:
-                            tries += 1
-                            continue
-                        ct = resp.headers.get("content-type", "")
-                        if not is_image_content_type(ct):
-                            # Some servers don't set content-type; still try reading
-                            data = await resp.read()
-                            return data, ct
+                async with session.get(url, timeout=self.timeout, headers=self.headers, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        tries += 1
+                        continue
+                    ct = resp.headers.get("content-type", "")
+                    if not is_image_content_type(ct):
+                        # Some servers don't set content-type; still try reading
                         data = await resp.read()
                         return data, ct
+                    data = await resp.read()
+                    return data, ct
             except Exception as e:
                 last_exc = e
                 tries += 1
@@ -309,18 +316,42 @@ class Downloader:
 
     async def download_many(self, urls: List[str]) -> int:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=self.timeout, sock_read=self.timeout)
-        connector = aiohttp.TCPConnector(limit=0, force_close=False)
+        connector = aiohttp.TCPConnector(limit=self.concurrency)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True) as session:
-            for url in urls:
-                if self.saved >= self.target_count:
-                    break
+            async def fetch_and_save(url: str) -> None:
                 data, ct = await self._fetch_bytes(session, url)
-                if not data:
-                    continue
-                saved_path = self._save_image(data, url, ct)
-                if saved_path:
-                    self.saved += 1
-                    print(f"[{self.saved}/{self.target_count}] saved: {saved_path}")
+                if data:
+                    saved_path = self._save_image(data, url, ct)
+                    if saved_path:
+                        self.saved += 1
+                        print(f"[{self.saved}/{self.target_count}] saved: {saved_path}")
+
+            it = iter(urls)
+            tasks: Set[asyncio.Task] = set()
+            # Prime initial batch
+            for _ in range(self.concurrency):
+                try:
+                    url = next(it)
+                except StopIteration:
+                    break
+                tasks.add(asyncio.create_task(fetch_and_save(url)))
+
+            while tasks and self.saved < self.target_count:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for _ in done:
+                    pass  # results already handled in fetch_and_save
+                if self.saved >= self.target_count:
+                    for t in tasks:
+                        t.cancel()
+                    break
+                for _ in done:
+                    try:
+                        url = next(it)
+                    except StopIteration:
+                        continue
+                    tasks.add(asyncio.create_task(fetch_and_save(url)))
+
+            await asyncio.gather(*tasks, return_exceptions=True)
         return self.saved
 
 
