@@ -11,6 +11,7 @@ Features
 - Deduplicates by file content (SHA-256).
 - Categorizes images into "high_quality" if resolution >= 1280x720.
 - Creates folder named from search term (e.g., "brad_pitt").
+- Preserves descriptive filenames from source URLs when possible.
 
 Usage
   python image_scraper.py --search "brad pitt" -n 100
@@ -36,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote
 
 import aiohttp
 from aiohttp import ClientSession
@@ -76,6 +77,14 @@ def slugify(text: str) -> str:
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s-]+", "_", text)
     return text[:100] if text else "query"
+
+def safe_filename(name: str) -> str:
+    """Sanitize a filename while preserving readability."""
+    name = unquote(name)
+    name = name.strip().replace("/", "_").replace("\\", "_")
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    name = re.sub(r"_+", "_", name)
+    return name[:120]
 
 def guess_ext(url: str, content_type: Optional[str]) -> str:
     # Priority 1: content-type
@@ -306,7 +315,21 @@ class Downloader:
         is_hq = qualifies_hq(img, self.min_hq_w, self.min_hq_h)
 
         subdir = self.hqdir if is_hq else self.outdir
-        path = subdir / f"{h}{ext}"
+
+        # Attempt to preserve a readable filename from the URL
+        basename = os.path.basename(urlparse(url).path)
+        basename = basename.split("?")[0].split("#")[0]
+        base, _ = os.path.splitext(basename)
+        base = safe_filename(base)
+        if base:
+            filename = f"{base}{ext}"
+        else:
+            filename = f"{h}{ext}"
+        path = subdir / filename
+        if path.exists():
+            filename = f"{base or h}_{h[:8]}{ext}"
+            path = subdir / filename
+
         try:
             with open(path, "wb") as f:
                 f.write(data)
