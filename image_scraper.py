@@ -142,11 +142,11 @@ def normalize_img_url(u: str) -> Optional[str]:
 
 # ---------------------------- URL Sources ----------------------------
 
-async def ddg_image_urls(query: str, max_results: int) -> List[str]:
+async def ddg_image_urls(query: str, max_results: int, gif_only: bool = False) -> List[str]:
     if not HAVE_DDG:
         print("[warn] duckduckgo_search not installed. `pip install duckduckgo_search`", file=sys.stderr)
         return []
-    urls = []
+    urls: List[str] = []
     # DDGS().images returns a generator of dicts with key 'image'
     try:
         with DDGS() as ddgs:
@@ -154,6 +154,7 @@ async def ddg_image_urls(query: str, max_results: int) -> List[str]:
                 query,
                 max_results=max_results,
                 safesearch="Off",  # You can change to "Moderate"/"Strict"
+                type_image="gif" if gif_only else None,
             ):
                 u = normalize_img_url(r.get("image") or r.get("thumbnail") or "")
                 if u:
@@ -241,6 +242,7 @@ class Downloader:
         min_hq_h: int = 720,
         jitter_ms: Tuple[int, int] = (50, 150),
         max_retries: int = 2,
+        gif_only: bool = False,
     ):
         self.outdir = outdir
         self.hqdir = outdir / "high_quality"
@@ -254,6 +256,7 @@ class Downloader:
         self.min_hq_h = min_hq_h
         self.jitter_ms = jitter_ms
         self.max_retries = max_retries
+        self.gif_only = gif_only
 
         self.hashes: Set[str] = set()
         self.saved = 0
@@ -295,6 +298,8 @@ class Downloader:
         ext = guess_ext(url, content_type)
         if ext.lower() not in VALID_EXTS:
             ext = ".jpg"
+        if self.gif_only and ext.lower() != ".gif":
+            return None
         h = self._hash_bytes(data)
         if h in self.hashes:
             return None
@@ -393,6 +398,7 @@ async def main():
     ap.add_argument("--max-candidates", type=int, default=5000, help="Max image URLs to gather before downloading (default 5000)")
     ap.add_argument("--also-scrape-pages", action="store_true", help="Also scrape top web pages for <img> tags")
     ap.add_argument("--pages", type=int, default=30, help="Number of search result pages to parse for additional inline images when --also-scrape-pages is set (default 30)")
+    ap.add_argument("--gif", action="store_true", help="Download only GIF images")
     args = ap.parse_args()
 
     query = args.search.strip()
@@ -411,7 +417,7 @@ async def main():
     # Gather more than needed to compensate for dead links
     want = min(args.max_candidates, max(args.n * 4, args.n + 200))
     print(f"[info] gathering up to {want} candidates from DuckDuckGo Images...")
-    ddg_urls = await ddg_image_urls(query, max_results=want)
+    ddg_urls = await ddg_image_urls(query, max_results=want, gif_only=args.gif)
     candidates.extend(ddg_urls)
 
     if args.also_scrape_pages:
@@ -424,6 +430,8 @@ async def main():
                 pages = await ddg_top_pages(query, max_pages=args.pages)
                 for i, p in enumerate(pages, 1):
                     imgs = await scrape_imgs_from_page(session, p, timeout=args.timeout)
+                    if args.gif:
+                        imgs = [u for u in imgs if u.lower().split('?')[0].endswith('.gif')]
                     candidates.extend(imgs)
                     print(f"[info] scraped page {i}/{len(pages)}: +{len(imgs)} images")
 
@@ -443,6 +451,7 @@ async def main():
         user_agent=args.user_agent,
         min_hq_w=args.hq_width,
         min_hq_h=args.hq_height,
+        gif_only=args.gif,
     )
 
     saved = await dl.download_many(candidates)
